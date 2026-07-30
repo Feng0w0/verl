@@ -60,6 +60,8 @@ def model_forward_gen(vision_model: bool = False):
             model_kwargs["pixel_values"] = multi_modal_inputs["pixel_values"].to(input_ids.device)
         if "image_grid_thw" in multi_modal_inputs:
             model_kwargs["image_grid_thw"] = multi_modal_inputs["image_grid_thw"].to(input_ids.device)
+        elif "grid_thws" in multi_modal_inputs:
+            model_kwargs["image_grid_thw"] = multi_modal_inputs["grid_thws"].to(input_ids.device)
         if "pixel_values_videos" in multi_modal_inputs:
             model_kwargs["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"].to(input_ids.device)
         if "video_grid_thw" in multi_modal_inputs:
@@ -237,6 +239,8 @@ def gptmodel_forward_no_padding(
         model_kwargs["pixel_values"] = multi_modal_inputs["pixel_values"].to(input_ids.device)
     if "image_grid_thw" in multi_modal_inputs:
         model_kwargs["image_grid_thw"] = multi_modal_inputs["image_grid_thw"].to(input_ids.device)
+    elif "grid_thws" in multi_modal_inputs:
+        model_kwargs["image_grid_thw"] = multi_modal_inputs["grid_thws"].to(input_ids.device)
     if "pixel_values_videos" in multi_modal_inputs:
         model_kwargs["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"].to(input_ids.device)
     if "video_grid_thw" in multi_modal_inputs:

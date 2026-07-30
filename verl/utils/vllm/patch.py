@@ -66,6 +66,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from vllm.model_executor.models.kimi_k25 import KimiK25ForConditionalGeneration
+
+    SUPPORTED_MOE_MODELS.append(KimiK25ForConditionalGeneration)
+except ImportError:
+    pass
+
 
 def patch_vllm_moe_model_weight_loader(model):
     # this is a work around to load the weight of vllm fused moe model
@@ -117,6 +124,11 @@ def patch_vllm_moe_model_weight_loader(model):
     # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
     if type(inner_model).__name__ == "Qwen3MoeLLMForCausalLM":
         inner_model = inner_model.model  # Reassign inner_model in Qwen3-vl
+
+    # VLM wrappers such as KimiK25 expose decoder layers under
+    # language_model.model.layers rather than language_model.layers.
+    if not hasattr(inner_model, "layers"):
+        inner_model = getattr(inner_model, "model", inner_model)
 
     for layer_idx, layer in enumerate(inner_model.layers):
         mlp_attr = MLP_ATTR_MAPPING.get(original_model_type, DEFAULT_MLP_ATTR)

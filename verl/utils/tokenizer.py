@@ -146,6 +146,8 @@ def hf_processor(name_or_path, **kwargs):
                 model_class = Glm4vModel
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
+            case "KimiK25Processor":
+                pass  # KimiK25Processor doesn't have get_rope_index property
             case _:
                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
 

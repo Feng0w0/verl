@@ -92,6 +92,45 @@ class LinearForLastLayer(torch.nn.Linear):
 
 # Make Megatron-Bridge AutoMapping treats the custom last layer as replicated.
 AutoMapping.register_module_type("LinearForLastLayer", "replicated")
+# Register MindSpeed (Huawei Ascend NPU) module types for Megatron-Bridge AutoMapping.
+# MindSpeed replaces TransformerEngine modules with its own implementations,
+# but AutoMapping doesn't know about them. We register them here.
+AutoMapping.register_module_type("MindSpeedTEColumnParallelGroupedLinear", "column")
+AutoMapping.register_module_type("MindSpeedTERowParallelGroupedLinear", "row")
+
+# Patch AutoMapping._detect_parallelism_type to handle MindSpeed modules
+# that require dynamic parallelism detection (based on module attributes or param names).
+_original_detect = AutoMapping._detect_parallelism_type
+
+
+def _patched_detect_parallelism_type(self, module):
+    module_type = type(module).__name__
+
+    # MindSpeedTELinear: has parallel_mode attribute like TELinear
+    if module_type == "MindSpeedTELinear":
+        parallel_mode = getattr(module, "parallel_mode", None)
+        if parallel_mode == "column":
+            return "column"
+        elif parallel_mode == "row":
+            return "row"
+        else:
+            return "replicated"
+
+    # MindSpeedTELayerNormColumnParallelLinear: fused layernorm + column parallel linear.
+    # weight/bias are column-parallel, layer_norm_weight/layer_norm_bias are replicated.
+    if module_type == "MindSpeedTELayerNormColumnParallelLinear":
+        if self.megatron_param and (
+            self.megatron_param.endswith("layer_norm_weight")
+            or self.megatron_param.endswith("layer_norm_bias")
+        ):
+            return "replicated"
+        return "column"
+
+    return _original_detect(self, module)
+
+
+AutoMapping._detect_parallelism_type_orig = _original_detect
+AutoMapping._detect_parallelism_type = _patched_detect_parallelism_type
 
 
 def make_value_model(hidden_size, sequence_parallel):

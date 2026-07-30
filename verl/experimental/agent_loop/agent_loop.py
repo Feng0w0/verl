@@ -742,6 +742,9 @@ class AgentLoopWorker:
             multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
         # Model's get_rope_index has been dynamically bind to the processor.
+        if not hasattr(self.processor, "get_rope_index"):
+            return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+
         vision_position_ids, _ = self.processor.get_rope_index(
             input_ids=input_ids,
             attention_mask=attention_mask,

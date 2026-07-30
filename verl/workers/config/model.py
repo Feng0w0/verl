@@ -204,6 +204,8 @@ class HFModelConfig(BaseConfig):
         # per model patch
         if getattr(self.hf_config, "model_type", None) == "kimi_vl":
             self.hf_config.text_config.topk_method = "greedy"
+        elif getattr(self.hf_config, "model_type", None) == "kimi_k25":
+            self.hf_config.text_config.topk_method = "greedy"
 
         # Ensure target_modules is a str or list[str] (only if not None)
         if self.target_modules is not None:

@@ -214,8 +214,11 @@ class vLLMHttpServer:
         # 1. setup vllm serve cli args
         engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
-        if self.config.get("limit_images", None):  # support for multi-image data
-            engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
+        limit_images = self.config.get("limit_images", None)
+        if limit_images is not None and limit_images > 0:
+            use_vision_chunk = getattr(self.model_config.hf_config, "use_unified_vision_chunk", False)
+            mm_key = "vision_chunk" if use_vision_chunk else "image"
+            engine_kwargs["limit_mm_per_prompt"] = {mm_key: limit_images}
         if self.config.cudagraph_capture_sizes:
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
@@ -552,8 +555,14 @@ class vLLMHttpServer:
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
+        use_vision_chunk = getattr(self.model_config.hf_config, "use_unified_vision_chunk", False)
         if image_data is not None:
-            multi_modal_data["image"] = image_data
+            if use_vision_chunk:
+                multi_modal_data["vision_chunk"] = [
+                    {"type": "image", "image": img, "uuid": None} for img in image_data
+                ]
+            else:
+                multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
 

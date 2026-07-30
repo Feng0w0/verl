@@ -190,3 +190,261 @@ def _ulysses_flash_attn_forward(
         return attn_output, None
     else:
         return attn_output, None, None
+
+
+def patch_kimi_k25_vision_flash_attn():
+    """Patch flash_attn_varlen_func in the dynamically loaded KimiK25 modeling module
+    with an NPU-compatible implementation using MindSpeed's npu_fusion_attention.
+    Also patch KimiK25VLModel.forward to pad inputs_embeds for TP-aligned scatter."""
+    try:
+        from mindspeed.ops.fusion_attention_v2 import npu_fusion_attention
+    except ImportError:
+        try:
+            import torch_npu
+            npu_fusion_attention = torch_npu.npu_fusion_attention
+        except ImportError:
+            npu_fusion_attention = None
+
+    if npu_fusion_attention is not None:
+        def _npu_flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            causal=False,
+            softmax_scale=None,
+            deterministic=False,
+        ):
+            head_num = q.shape[1]
+            scale = softmax_scale if softmax_scale is not None else (1.0 / (q.shape[-1] ** 0.5))
+            actual_seq_qlen = cu_seqlens_q.tolist() if isinstance(cu_seqlens_q, torch.Tensor) else list(cu_seqlens_q)
+            actual_seq_kvlen = cu_seqlens_k.tolist() if isinstance(cu_seqlens_k, torch.Tensor) else list(cu_seqlens_k)
+            output = npu_fusion_attention(
+                q, k, v, head_num, "TND",
+                scale=scale,
+                keep_prob=1.0,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen,
+            )
+            return output[0]
+
+        import sys
+        for mod_name, mod in list(sys.modules.items()):
+            if "modeling_kimi_k25" in mod_name and hasattr(mod, "flash_attn_varlen_func"):
+                if mod.flash_attn_varlen_func is None:
+                    mod.flash_attn_varlen_func = _npu_flash_attn_varlen_func
+                    print(f"Patched flash_attn_varlen_func in {mod_name} with NPU implementation")
+
+    _patch_kimi_k25_vl_forward_scatter_padding()
+
+
+def _collapse_media_placeholders(
+    inputs_embeds, attention_mask, input_ids, labels, position_ids,
+    image_token_index, feature_lengths,
+):
+    """Collapse consecutive <|media_pad|> tokens into a single placeholder
+    per image, keeping only the first token of each run and removing the rest.
+
+    This is needed when vLLM rollout produces input_ids with expanded
+    <|media_pad|> tokens (e.g., 240 consecutive placeholders for one image)
+    but HF _merge_input_ids_with_image_features expects exactly 1 placeholder
+    per image.
+
+    Args:
+        inputs_embeds: (seq_len, batch_size, hidden_dim) in SBD format
+        attention_mask: (batch_size, seq_len)
+        input_ids: (batch_size, seq_len)
+        labels: (batch_size, seq_len) or None
+        position_ids: (batch_size, seq_len) or None
+        image_token_index: token ID for <|media_pad|>
+        feature_lengths: list of feature lengths per image
+
+    Returns:
+        Collapsed versions of inputs_embeds, attention_mask, input_ids,
+        labels, position_ids
+    """
+    batch_size, seq_len = input_ids.shape
+    is_media = (input_ids == image_token_index)
+
+    # A position is the start of a run if it is media AND the previous
+    # position is NOT media (or it is position 0).
+    run_start = is_media & ~torch.cat(
+        [torch.zeros(batch_size, 1, dtype=torch.bool, device=input_ids.device),
+         is_media[:, :-1]], dim=1)
+    # A position is inside a run (not the start) if it is media AND the
+    # previous position is also media.
+    run_inner = is_media & torch.cat(
+        [torch.zeros(batch_size, 1, dtype=torch.bool, device=input_ids.device),
+         is_media[:, :-1]], dim=1)
+
+    # Keep: all non-media positions + start of each media run
+    keep = ~is_media | run_start  # (batch_size, seq_len)
+
+    # Build index arrays for gathering kept positions per sample
+    kept_counts = keep.sum(dim=1)  # (batch_size,)
+    new_seq_len = kept_counts.max().item()
+
+    new_input_ids = torch.zeros(batch_size, new_seq_len, dtype=input_ids.dtype, device=input_ids.device)
+    new_attention_mask = torch.zeros(batch_size, new_seq_len, dtype=attention_mask.dtype, device=attention_mask.device)
+    hidden_dim = inputs_embeds.shape[2]
+    new_inputs_embeds = torch.zeros(new_seq_len, batch_size, hidden_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+
+    if labels is not None:
+        new_labels = torch.full((batch_size, new_seq_len), -100, dtype=labels.dtype, device=labels.device)
+    else:
+        new_labels = None
+
+    for b in range(batch_size):
+        idxs = keep[b].nonzero(as_tuple=True)[0]
+        n = idxs.shape[0]
+        new_input_ids[b, :n] = input_ids[b, idxs]
+        new_attention_mask[b, :n] = attention_mask[b, idxs]
+        new_inputs_embeds[:n, b, :] = inputs_embeds[idxs, b, :]
+        if labels is not None:
+            new_labels[b, :n] = labels[b, idxs]
+
+    # position_ids must be recomputed after collapse since token positions
+    # have changed.  Set to None and let downstream code recompute.
+    new_position_ids = None
+
+    return new_inputs_embeds, new_attention_mask, new_input_ids, new_labels, new_position_ids
+
+
+def _patch_kimi_k25_vl_forward_scatter_padding():
+    """Patch KimiK25VLModel.forward to pad inputs_embeds so that the first dim
+    is divisible by tensor_model_parallel_size before scatter_to_sequence_parallel_region.
+    After merging image features, the sequence length may not be TP-aligned."""
+    try:
+        from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
+    except ImportError:
+        return
+
+    if hasattr(KimiK25VLModel, "_verl_patched_scatter_padding"):
+        return
+
+    _orig_forward = KimiK25VLModel.forward
+
+    def _patched_forward(self, *args, **kwargs):
+        result = _orig_forward(self, *args, **kwargs)
+        return result
+
+    import torch
+    from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
+
+    _orig_forward = KimiK25VLModel.forward
+
+    def _patched_forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                         inputs_embeds=None, pixel_values=None, image_grid_thw=None,
+                         labels=None, runtime_gather_output=None, *, loss_mask=None):
+        if self.pre_process:
+            if inputs_embeds is None:
+                inputs_embeds = self.language_model.embedding(input_ids=input_ids, position_ids=None)
+
+            if pixel_values is not None:
+                image_features = self._extract_image_features(pixel_values, image_grid_thw)
+                image_features = self.mm_projector(image_features)
+                inputs_embeds = inputs_embeds.to(image_features[0].dtype)
+
+                image_token_index = self.config.media_placeholder_token_id
+                if input_ids is not None:
+                    media_mask = (input_ids == image_token_index)
+                    if attention_mask is not None:
+                        media_mask = media_mask & attention_mask.bool()
+                    n_placeholders = media_mask.sum().item()
+                else:
+                    n_placeholders = 0
+                total_features = sum(f.shape[0] for f in image_features)
+                n_images = len(image_features)
+                feature_lengths = [f.shape[0] for f in image_features]
+
+                # Determine which branch to take
+                if n_placeholders == n_images:
+                    branch = "MERGE (unexpanded)"
+                elif n_placeholders == total_features:
+                    branch = "INJECT (fully expanded)"
+                elif n_placeholders > n_images and n_placeholders % n_images == 0:
+                    branch = f"REPEAT+MERGE (multi-turn/expanded: ph={n_placeholders} img={n_images})"
+                else:
+                    branch = f"COLLAPSE+MERGE (fallback: ph={n_placeholders} img={n_images} feat={total_features})"
+
+                print(f"[KimiK25-VL] branch={branch} | n_placeholders={n_placeholders} "
+                      f"n_images={n_images} total_features={total_features} "
+                      f"feature_lengths={feature_lengths} "
+                      f"input_ids_shape={list(input_ids.shape) if input_ids is not None else None} "
+                      f"pixel_values_shape={list(pixel_values.shape) if pixel_values is not None else None} "
+                      f"image_grid_thw={image_grid_thw}")
+
+                if n_placeholders == n_images:
+                    # Unexpanded: 1 placeholder per image → HF merge
+                    inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+                    inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                        image_features, inputs_embeds, input_ids, attention_mask, labels,
+                    )
+                    inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+                elif n_placeholders == total_features:
+                    # Fully expanded: 1 placeholder per feature slot → direct inject
+                    inputs_embeds_btd = inputs_embeds.transpose(1, 0).contiguous()
+                    flat_features = torch.cat(image_features, dim=0)
+                    mask = (input_ids == image_token_index)
+                    if attention_mask is not None:
+                        mask = mask & attention_mask.bool()
+                    inputs_embeds_btd[mask] = flat_features.to(inputs_embeds_btd.dtype)
+                    inputs_embeds = inputs_embeds_btd.transpose(1, 0).contiguous()
+                elif n_placeholders > n_images and n_placeholders % n_images == 0:
+                    # More placeholders than images, and evenly divisible.
+                    # This happens in multi-turn conversations where the same image
+                    # appears in multiple turns (each turn adds a <|media_pad|>),
+                    # or when vLLM partially expanded placeholders.
+                    # Repeat image_features so that each placeholder has a
+                    # corresponding feature entry, then use HF merge.
+                    repeat = n_placeholders // n_images
+                    expanded_image_features = image_features * repeat
+                    inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+                    inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                        expanded_image_features, inputs_embeds, input_ids, attention_mask, labels,
+                    )
+                    inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+                else:
+                    # Fallback: collapse consecutive placeholders then merge
+                    inputs_embeds, attention_mask, input_ids, labels, position_ids = \
+                        _collapse_media_placeholders(
+                            inputs_embeds, attention_mask, input_ids, labels,
+                            position_ids, image_token_index, feature_lengths,
+                        )
+                    inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+                    inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                        image_features, inputs_embeds, input_ids, attention_mask, labels,
+                    )
+                    inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+
+        if self.config.sequence_parallel:
+            seq_len = inputs_embeds.shape[0]
+            tp_size = self.config.tensor_model_parallel_size
+            pad_len = (tp_size - seq_len % tp_size) % tp_size
+            if pad_len > 0:
+                pad_tensor = torch.zeros(pad_len, inputs_embeds.shape[1], inputs_embeds.shape[2],
+                                         dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+                inputs_embeds = torch.cat([inputs_embeds, pad_tensor], dim=0)
+                if attention_mask is not None:
+                    pad_mask = torch.zeros(attention_mask.shape[0], pad_len,
+                                           dtype=attention_mask.dtype, device=attention_mask.device)
+                    attention_mask = torch.cat([attention_mask, pad_mask], dim=-1)
+            inputs_embeds = scatter_to_sequence_parallel_region(inputs_embeds)
+
+        # NPU flash attention requires specific mask format; let Megatron build
+        # causal mask internally instead of passing a bool attention_mask.
+        from verl.utils.device import is_npu_available
+        if is_npu_available:
+            attention_mask = None
+
+        outputs = self.language_model.forward(
+            input_ids=None, position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=inputs_embeds,
+            labels=labels, loss_mask=loss_mask,
+            runtime_gather_output=runtime_gather_output,
+        )
+        return outputs
+
+    KimiK25VLModel.forward = _patched_forward
+    KimiK25VLModel._verl_patched_scatter_padding = True
+    print("Patched KimiK25VLModel.forward with TP-aligned scatter padding")

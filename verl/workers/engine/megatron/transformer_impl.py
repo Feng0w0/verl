@@ -170,6 +170,12 @@ class MegatronEngine(BaseEngine):
             provider.context_parallel_size = self.engine_config.context_parallel_size
             provider.sequence_parallel = self.engine_config.sequence_parallel
 
+            # MindSpeed modules expect use_ascend_mc2 on the config
+            if not hasattr(provider, "use_ascend_mc2"):
+                provider.use_ascend_mc2 = False
+            if not hasattr(provider, "attention_mask_type"):
+                provider.attention_mask_type = "causal"
+
             # Match verl implementation (need variable_seq_lengths)
             from megatron.core.transformer.enums import AttnBackend
 
@@ -257,6 +263,10 @@ class MegatronEngine(BaseEngine):
         if self.enable_routing_replay:
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
 
+        if getattr(self.model_config.hf_config, "model_type", None) in ("kimi_vl", "kimi_k25"):
+            from verl.models.transformers.kimi_vl import patch_kimi_k25_vision_flash_attn
+            patch_kimi_k25_vision_flash_attn()
+
         return module
 
     def _maybe_enable_fused_kernels(self):
@@ -311,6 +321,9 @@ class MegatronEngine(BaseEngine):
         )
 
     def initialize(self):
+        for key in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+            os.environ.pop(key, None)
+
         self._build_tf_config()
 
         self.module = self._build_megatron_module()
@@ -799,6 +812,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
             forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
 
             def logits_processor(logits, label, temperature):
+                if logits.shape[1] != label.shape[1]:
+                    label_seq_len = label.shape[1]
+                    logits = logits[:, :label_seq_len]
                 assert logits.shape[:2] == label.shape[:2]
                 # avoid non-positive temperature such as padding
                 temperature[temperature <= 0] = 1e-8
