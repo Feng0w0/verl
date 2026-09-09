@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PROJECT=/home/h00943455/Qwen3.8-Flash-Next/verl-qwen38-veomni
+source /usr/local/Ascend/cann-9.1.0/set_env.sh
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate verl-qwen38-flash-veomni
+set +u
+source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+set -u
+cd "$PROJECT"
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-2,3,4,5}
+export TOKENIZERS_PARALLELISM=false
+export HCCL_CONNECT_TIMEOUT=600
+export VLLM_ASCEND_ENABLE_NZ=0
+export VLLM_USE_V1=1
+export WANDB_MODE=disabled
+export HYDRA_FULL_ERROR=1
+export OMP_NUM_THREADS=4
+export RAY_DEDUP_LOGS=0
+export TRITON_CACHE_DIR=/tmp/triton-qwen38-torch210
+python scripts/prepare_qwen38_grpo_smoke.py
+numactl --interleave=all python -m verl.trainer.main_ppo \
+  model_engine=veomni \
+  ray_kwargs.ray_init.num_cpus=32 \
+  +ray_kwargs.ray_init.address=local \
+  +ray_kwargs.ray_init._temp_dir=/tmp/ray-qwen38-grpo \
+  +ray_kwargs.ray_init.object_store_memory=2147483648 \
+  +ray_kwargs.ray_init.include_dashboard=false \
+  algorithm.adv_estimator=grpo \
+  algorithm.use_kl_in_reward=false \
+  data.train_files="$PROJECT/artifacts/qwen38-grpo/data/train.parquet" \
+  data.val_files="$PROJECT/artifacts/qwen38-grpo/data/val.parquet" \
+  data.train_batch_size=2 \
+  data.max_prompt_length=128 \
+  data.max_response_length=8 \
+  data.filter_overlong_prompts=true \
+  data.truncation=error \
+  actor_rollout_ref.model.path=/mnt/weight/Qwen3.8-Flash-Next-3layer-grpo \
+  actor_rollout_ref.model.trust_remote_code=true \
+  actor_rollout_ref.model.enable_gradient_checkpointing=true \
+  actor_rollout_ref.model.use_remove_padding=true \
+  actor_rollout_ref.actor.optim.lr=1e-5 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=2 \
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.actor.use_dynamic_bsz=false \
+  actor_rollout_ref.actor.use_kl_loss=false \
+  actor_rollout_ref.actor.entropy_coeff=0 \
+  actor_rollout_ref.actor.veomni.fsdp_size=4 \
+  actor_rollout_ref.actor.veomni.expert_parallel_size=4 \
+  actor_rollout_ref.actor.veomni.ple_parallel_size=1 \
+  actor_rollout_ref.actor.veomni.broadcast_model_weights_from_rank0=false \
+  actor_rollout_ref.actor.veomni.ep_sharded_stream_load=true \
+  actor_rollout_ref.actor.veomni.mixed_precision=true \
+  actor_rollout_ref.actor.veomni.param_offload=false \
+  actor_rollout_ref.actor.veomni.optimizer_offload=false \
+  actor_rollout_ref.actor.veomni.use_torch_compile=false \
+  actor_rollout_ref.actor.veomni.forward_prefetch=false \
+  actor_rollout_ref.actor.veomni.attn_implementation=sdpa \
+  actor_rollout_ref.actor.veomni.moe_implementation=fused_npu \
+  actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+  actor_rollout_ref.rollout.agent.num_workers=1 \
+  actor_rollout_ref.rollout.n=4 \
+  actor_rollout_ref.rollout.temperature=1.0 \
+  actor_rollout_ref.rollout.top_p=1.0 \
+  actor_rollout_ref.rollout.top_k=-1 \
+  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false \
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.18 \
+  actor_rollout_ref.rollout.free_cache_engine=false \
+  +actor_rollout_ref.rollout.enable_sleep_mode=false \
+  actor_rollout_ref.rollout.enforce_eager=true \
+  actor_rollout_ref.rollout.enable_prefix_caching=false \
+  actor_rollout_ref.rollout.enable_chunked_prefill=false \
+  actor_rollout_ref.rollout.max_model_len=2048 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=2048 \
+  actor_rollout_ref.rollout.max_num_seqs=8 \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.language_model_only=true \
+  reward.custom_reward_function.path="$PROJECT/scripts/prepare_qwen38_grpo_smoke.py" \
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.enable_cpu_binding=false \
+  reward.num_workers=1 \
+  reward.custom_reward_function.name=compute_score \
+  trainer.device=npu \
+  trainer.n_gpus_per_node=4 \
+  trainer.nnodes=1 \
+  trainer.logger=console \
+  trainer.project_name=qwen38_veomni \
+  trainer.experiment_name=3layer_grpo_4npu \
+  trainer.val_before_train=false \
+  trainer.test_freq=-1 \
+  trainer.save_freq=2 \
+  trainer.resume_mode=disable \
+  trainer.total_training_steps=2 \
+  trainer.total_epochs=1 \
+  trainer.default_local_dir="$PROJECT/artifacts/qwen38-grpo/checkpoints" \
+  trainer.rollout_data_dir="$PROJECT/artifacts/qwen38-grpo/rollouts" \
+  "$@"

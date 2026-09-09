@@ -49,3 +49,48 @@ def test_apply_npu_vllm_patches_accepts_modular_fused_moe(monkeypatch):
     npu_vllm_patch.apply_npu_vllm_patches()
 
     rotary_patch.assert_called_once_with()
+
+
+def test_modular_ascend_moe_reload_restores_layout_once(monkeypatch):
+    import torch
+
+    patch = _load_npu_vllm_patch_module()
+    monkeypatch.setattr(patch, "is_torch_npu_available", lambda check_device=False: True)
+    ascend_module = ModuleType("vllm_ascend.ops.fused_moe.fused_moe")
+
+    class AscendMethod:
+        pass
+
+    ascend_module.AscendUnquantizedFusedMoEMethod = AscendMethod
+    monkeypatch.setitem(sys.modules, ascend_module.__name__, ascend_module)
+
+    checkpoint_w13 = torch.arange(2 * 8 * 6).reshape(2, 8, 6).float()
+    checkpoint_w2 = torch.arange(2 * 6 * 4).reshape(2, 6, 4).float()
+    layer = torch.nn.Module()
+    layer.quant_method = AscendMethod()
+    layer.w13_weight = torch.nn.Parameter(checkpoint_w13.transpose(1, 2).contiguous())
+    layer.w2_weight = torch.nn.Parameter(checkpoint_w2.transpose(1, 2).contiguous())
+    alias = torch.nn.Module()
+    alias.quant_method = layer.quant_method
+    alias.w13_weight = layer.w13_weight
+    alias.w2_weight = layer.w2_weight
+    other = torch.nn.Module()
+    other.quant_method = object()
+    other.w13_weight = torch.nn.Parameter(torch.zeros(2, 6, 8))
+    model = torch.nn.ModuleList([layer, alias, other])
+    for _ in range(2):
+        assert patch.prepare_npu_moe_weights_for_reload(model) == 2
+        torch.testing.assert_close(layer.w13_weight, checkpoint_w13)
+        torch.testing.assert_close(layer.w2_weight, checkpoint_w2)
+        assert other.w13_weight.shape == (2, 6, 8)
+        # Emulate Ascend's post-load processing between reloads.
+        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
+        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+
+
+def test_moe_reload_is_noop_without_npu(monkeypatch):
+    patch = _load_npu_vllm_patch_module()
+    monkeypatch.setattr(patch, "is_torch_npu_available", lambda check_device=False: False)
+    model = Mock()
+    assert patch.prepare_npu_moe_weights_for_reload(model) == 0
+    model.modules.assert_not_called()

@@ -43,6 +43,7 @@ from verl.utils.ulysses import (
     set_ulysses_sequence_parallel_group,
     slice_input_tensor,
 )
+from verl.utils.veomni.frozen_ple import FrozenPLEGuard, is_ple_table, prepare_ple_storage
 from verl.utils.veomni.router_replay import RouterReplayAction, VeOmniRouterReplay
 from verl.workers.config import HFModelConfig, VeOmniEngineConfig, VeOmniOptimizerConfig
 
@@ -164,11 +165,20 @@ class VeOmniEngine(FSDPEngine):
             data_parallel_replicate_size = dp_size // fsdp_size
             data_parallel_shard_size = fsdp_size
 
+        for name, size in {
+            "expert_parallel_size": self.engine_config.expert_parallel_size,
+            "ple_parallel_size": self.engine_config.ple_parallel_size,
+        }.items():
+            if dp_size % size:
+                raise ValueError(f"Data parallel size ({dp_size}) must be divisible by {name} ({size}).")
+
         parallel_state.init_parallel_state(
             dp_size=dp_size,
             dp_replicate_size=data_parallel_replicate_size,
             dp_shard_size=data_parallel_shard_size,
-            extra_parallel_sizes=(self.engine_config.expert_parallel_size,),
+            extra_parallel_sizes=(self.engine_config.expert_parallel_size, self.engine_config.ple_parallel_size),
+            extra_parallel_placement_innermost=(False, False),
+            extra_parallel_names=("ep", "ple"),
             ulysses_size=self.engine_config.ulysses_parallel_size,
             dp_mode=self.data_parallel_mode,
         )
@@ -364,10 +374,27 @@ class VeOmniEngine(FSDPEngine):
             ),
             enable_reentrant=self.engine_config.enable_reentrant,
             enable_forward_prefetch=self.engine_config.forward_prefetch,
-            broadcast_model_weights_from_rank0=True,
+            broadcast_model_weights_from_rank0=self.engine_config.broadcast_model_weights_from_rank0,
+            ep_sharded_stream_load=self.engine_config.ep_sharded_stream_load,
             fqn_to_index_mapping=load_safetensors_index(self.model_config.local_path),
         )
+        # VeOmni upcasts the model to FP32 during parallelization. Restore only
+        # the ignored, persistently sharded frozen tables before optimizer setup.
+        if self.engine_config.freeze_ple_embeddings:
+            prepare_ple_storage(module, self.engine_config.frozen_ple_dtype)
         log_gpu_memory_usage("After parallelize model", logger=logger)
+        self._frozen_ple_guard = (
+            FrozenPLEGuard(module, expected_device=get_device_name())
+            if self.engine_config.freeze_ple_embeddings
+            else None
+        )
+        if self._frozen_ple_guard is not None:
+            logger.warning(
+                "Frozen PLE: %d tables, %.3f GiB local on rank %d",
+                len(self._frozen_ple_guard.parameters),
+                self._frozen_ple_guard.local_bytes / 2**30,
+                self.rank,
+            )
 
         if not self.engine_config.forward_only:
             # Initialize optimizer with model parameters and config settings
@@ -381,6 +408,8 @@ class VeOmniEngine(FSDPEngine):
         self.module = module
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
+        if self._frozen_ple_guard is not None:
+            self._frozen_ple_guard.verify(self.module, self.optimizer)
 
     def optimizer_step(self):
         """
@@ -400,6 +429,9 @@ class VeOmniEngine(FSDPEngine):
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
+        if self._frozen_ple_guard is not None:
+            self._frozen_ple_guard.verify(self.module, self.optimizer)
+            logger.warning("Frozen PLE verified after optimizer step on rank %d", self.rank)
         return grad_norm.item()
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
@@ -650,6 +682,10 @@ class VeOmniEngine(FSDPEngine):
 
         def param_generator():
             for name, param in params.items():
+                # Rollout loaded the identical immutable table from model.path.
+                # Do not all-gather or retransmit it on every policy update.
+                if self.engine_config.freeze_ple_embeddings and is_ple_table(name):
+                    continue
                 unsharded_tensor = (
                     param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
                 )

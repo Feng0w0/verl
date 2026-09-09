@@ -54,6 +54,34 @@ def _patch_legacy_fused_moe_weight_loader(fused_moe) -> bool:
     return True
 
 
+def prepare_npu_moe_weights_for_reload(model) -> int:
+    """Restore Ascend unquantized experts to checkpoint orientation once per reload.
+
+    Ascend transposes these tensors after loading. Modular vLLM's RoutedExperts
+    loader expects their original orientation, and the legacy class-level wrapper
+    does not cover that loader. Post-processing restores the kernel orientation
+    after the complete weight stream has been consumed.
+    """
+    if not is_torch_npu_available(check_device=False):
+        return 0
+
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+    seen = set()
+    for layer in model.modules():
+        if not isinstance(getattr(layer, "quant_method", None), AscendUnquantizedFusedMoEMethod):
+            continue
+        for name in ("w13_weight", "w2_weight"):
+            param = getattr(layer, name, None)
+            if param is None or id(param) in seen:
+                continue
+            if param.ndim != 3:
+                raise ValueError(f"Expected a 3D Ascend expert tensor for {name}, got {param.shape}")
+            param.data = param.data.transpose(1, 2).contiguous()
+            seen.add(id(param))
+    return len(seen)
+
+
 def patch_vllm013_rotary_emb():
     from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 

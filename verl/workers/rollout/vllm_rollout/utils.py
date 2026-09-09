@@ -283,8 +283,11 @@ class vLLMColocateWorkerExtension:
             ]
         else:
             # TODO(wuxibin): not need anymore for newer vllm version.
+            from verl.utils.vllm.npu_vllm_patch import prepare_npu_moe_weights_for_reload
+
             for model in self._iter_all_models():
                 patch_vllm_moe_model_weight_loader(model)
+                prepare_npu_moe_weights_for_reload(model)
 
         # =========================== step 2: receive weights and update ===========================
         receiver = BucketedWeightReceiver(
