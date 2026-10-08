@@ -16,7 +16,7 @@ import os
 
 import torch
 
-from verl.utils.device import get_device_id, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.workers.engine.utils import _prodshape
 
 VL_TYPE2INDEX = {
@@ -90,6 +90,9 @@ def offload_veomni_optimizer(optimizer):
     else:
         optimizers.append(optimizer)
 
+    # On NPU, asynchronous D2H copies allocate pinned host memory for every
+    # optimizer state tensor. Keep persistent offloaded states pageable.
+    cpu_non_blocking = get_device_name() != "npu"
     for opt in optimizers:
         if not opt.state:
             continue
@@ -98,7 +101,7 @@ def offload_veomni_optimizer(optimizer):
                 state = opt.state[param]
                 for key, value in state.items():
                     if isinstance(value, torch.Tensor):
-                        state[key] = value.to("cpu", non_blocking=True)
+                        state[key] = value.to("cpu", non_blocking=cpu_non_blocking)
 
 
 @torch.no_grad()

@@ -1332,6 +1332,20 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
+            # # Server actors have a separate Ray runtime environment. Preserve
+            # # CANN's Python and library paths for their vLLM child processes.
+            # for key in ("PYTHONPATH", "LD_LIBRARY_PATH", "PATH"):
+            #     value = os.environ.get(key)
+            #     if value:
+            #         env_vars[key] = value
+            # # TaskRunner's Ray runtime_env intentionally has a small allowlist,
+            # # so its actor environment does not retain CANN's Python path.
+            # # vLLM then forks workers that import ``acl.rt`` for CaMem.
+            # cann_root = "/mnt/share/cann/CANN_9_2_0_B020/cann-9.2.0"
+            # cann_python = f"{cann_root}/python/site-packages"
+            # cann_lib = f"{cann_root}/lib64"
+            # env_vars["PYTHONPATH"] = f"{cann_python}:{env_vars.get('PYTHONPATH', '')}"
+            # env_vars["LD_LIBRARY_PATH"] = f"{cann_lib}:{env_vars.get('LD_LIBRARY_PATH', '')}"
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
