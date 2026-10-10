@@ -179,8 +179,7 @@ class VeOmniEngine(FSDPEngine):
             extra_parallel_sizes=(self.engine_config.expert_parallel_size, self.engine_config.ple_parallel_size),
             extra_parallel_placement_innermost=(False, False),
             extra_parallel_names=("ep", "ple"),
-            ulysses_size=self.engine_config.ulysses_parallel_size,
-            dp_mode=self.data_parallel_mode,
+            ulysses_size=self.engine_config.ulysses_parallel_size
         )
         if accelerator.dp_size != dp_size:
             raise ValueError(
