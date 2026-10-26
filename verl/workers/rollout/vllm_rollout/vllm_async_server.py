@@ -395,6 +395,11 @@ class vLLMHttpServer:
                 "data_parallel_address": self._master_address,
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
+            # The primary API server uses internal DP load balancing with
+            # headless peers. An explicit start rank opts recent vLLM into
+            # hybrid load balancing, which rejects those headless engines.
+            if self.node_rank == 0:
+                dp_args.pop("data_parallel_start_rank")
             args.update(dp_args)
 
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})

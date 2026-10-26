@@ -16,6 +16,7 @@
 
 
 from functools import wraps
+from importlib import import_module
 
 from verl.utils.device import is_torch_npu_available
 
@@ -52,6 +53,41 @@ def _patch_legacy_fused_moe_weight_loader(fused_moe) -> bool:
     wrapped_weight_loader._verl_npu_weight_loader_patched = True
     fused_moe.weight_loader = wrapped_weight_loader
     return True
+
+
+def prepare_npu_moe_weights_for_reload(model) -> int:
+    """Restore Ascend unquantized experts to checkpoint orientation once per reload.
+
+    Ascend transposes these tensors after loading. Modular vLLM's RoutedExperts
+    loader expects their original orientation, and the legacy class-level wrapper
+    does not cover that loader. Post-processing restores the kernel orientation
+    after the complete weight stream has been consumed.
+    """
+    if not is_torch_npu_available(check_device=False):
+        return 0
+
+    module = import_module("vllm_ascend.ops.fused_moe.fused_moe")
+    AscendUnquantizedFusedMoEMethod = getattr(module, "AscendUnquantizedFusedMoEMethod", None)
+    if AscendUnquantizedFusedMoEMethod is None:
+        # Modular Ascend releases moved expert weight ownership here.
+        module = import_module("vllm_ascend.ops.fused_moe.routed_experts")
+        AscendUnquantizedFusedMoEMethod = module.AscendUnquantizedFusedMoEMethod
+
+    seen = set()
+    for layer in model.modules():
+        if not isinstance(getattr(layer, "quant_method", None), AscendUnquantizedFusedMoEMethod):
+            continue
+        for name in ("w13_weight", "w2_weight"):
+            param = getattr(layer, name, None)
+            if param is None or id(param) in seen:
+                continue
+            if param.ndim != 3:
+                raise ValueError(f"Expected a 3D Ascend expert tensor for {name}, got {param.shape}")
+            # Keep the captured graph storage alive and update it through a view.
+            # Post-load transpose restores the original contiguous kernel layout.
+            param.data = param.data.transpose(1, 2)
+            seen.add(id(param))
+    return len(seen)
 
 
 def patch_vllm013_rotary_emb():
